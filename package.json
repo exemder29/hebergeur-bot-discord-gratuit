@@ -1,0 +1,21 @@
+{
+  "name": "candidatures-discord-bot",
+  "version": "1.0.0",
+  "description": "Bot Discord qui indique si les candidatures du site sont ouvertes ou fermées",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "bg": "node daemon.js start",
+    "stop": "node daemon.js stop",
+    "status": "node daemon.js status",
+    "logs": "node daemon.js logs",
+    "test": "node test-status.js && node test-panel.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "discord.js": "^14.22.1",
+    "dotenv": "^16.4.5"
+  }
+}
