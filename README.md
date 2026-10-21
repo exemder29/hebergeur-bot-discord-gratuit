@@ -1,9 +1,12 @@
 # Explorateur Terminal
 
-Site statique : `index.html` + `logo.svg`. Connexion et sauvegarde via Firebase (projet `bot-discord-e9166`).
+Site statique : `index.html` + `style.css` + `app.js` + `auth.js` + `logo.svg`. Connexion et sauvegarde via Firebase (projet `bot-discord-e9166`).
 
 ## Fichiers
-- `index.html` : le site
+- `index.html` : la page
+- `style.css` : le design
+- `app.js` : explorateur de fichiers et terminal simulé
+- `auth.js` : connexion et sauvegarde Firebase
 - `logo.svg` : logo (aussi utilisé comme icône d'onglet)
 - `firestore.rules` : règles de sécurité Firestore (chaque compte ne voit que ses fichiers)
 - `firebase.json`, `.firebaserc` : configuration pour `firebase deploy`

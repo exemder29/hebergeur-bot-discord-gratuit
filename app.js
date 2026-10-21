@@ -1,0 +1,642 @@
+(() => {
+'use strict';
+const $ = s => document.querySelector(s);
+class CmdError extends Error {}
+const enc = new TextEncoder();
+const byteLen = s => enc.encode(s).length;
+const fmt = n => n < 1024 ? n + ' o' : n < 1048576 ? (n / 1024).toFixed(n < 10240 ? 1 : 0) + ' Ko' : (n / 1048576).toFixed(1) + ' Mo';
+
+/* ---------- Système de fichiers en mémoire ---------- */
+const mkDir = () => ({ t: 'd', kids: new Map() });
+const mkText = c => ({ t: 'f', kind: 'text', content: c, size: byteLen(c) });
+const root = mkDir();
+const getNode = ps => { let n = root; for (const s of ps) { if (n.t !== 'd') return null; n = n.kids.get(s); if (!n) return null; } return n; };
+const toPath = ps => '/' + ps.join('/');
+const isPrefix = (a, b) => a.length <= b.length && a.every((s, i) => s === b[i]);
+const absParts = (p, base) => {
+  let ps = (p.startsWith('/') || p.startsWith('~')) ? [] : [...base];
+  if (p.startsWith('~')) p = p.slice(1);
+  for (const s of p.split('/')) { if (!s || s === '.') continue; if (s === '..') ps.pop(); else ps.push(s); }
+  return ps;
+};
+function ensureDirs(ps) {
+  let n = root;
+  for (const s of ps) {
+    let k = n.kids.get(s);
+    if (!k) { k = mkDir(); n.kids.set(s, k); }
+    else if (k.t !== 'd') throw new CmdError(s + ' est un fichier');
+    n = k;
+  }
+  return n;
+}
+function putFile(ps, f) {
+  const par = getNode(ps.slice(0, -1));
+  if (!par || par.t !== 'd') throw new CmdError(toPath(ps.slice(0, -1)) + ' : dossier introuvable');
+  const name = ps[ps.length - 1], old = par.kids.get(name);
+  if (old && old.t === 'd') throw new CmdError(name + ' est un dossier');
+  par.kids.set(name, f);
+}
+const removeNode = ps => getNode(ps.slice(0, -1)).kids.delete(ps[ps.length - 1]);
+const clone = n => { if (n.t === 'f') return { ...n }; const d = mkDir(); for (const [k, v] of n.kids) d.kids.set(k, clone(v)); return d; };
+const sorted = node => [...node.kids.entries()].sort(([a, x], [b, y]) => x.t === y.t ? a.localeCompare(b, 'fr') : (x.t === 'd' ? -1 : 1));
+
+/* Fichiers d'exemple (à supprimer quand tu veux) */
+{
+  const ex = ensureDirs(['exemple']);
+  ex.kids.set('LISEZMOI.txt', mkText("Dossier d'exemple pour essayer le terminal.\nSupprime-le avec : rm -r /exemple\n"));
+  ex.kids.set('index.js', mkText("console.log('Bonjour depuis le bot');\n"));
+  ex.kids.set('package.json', mkText('{\n  "name": "mon-bot",\n  "version": "1.0.0",\n  "scripts": { "start": "node index.js" }\n}\n'));
+}
+
+/* ---------- État ---------- */
+let cwd = [];          // dossier courant du terminal
+let exp = [];          // dossier affiché dans l'explorateur
+let view = null;       // fichier ouvert dans l'explorateur
+let shownNode = null, shownPath = '';
+const history = []; let hIdx = 0;
+
+/* ---------- Terminal : affichage ---------- */
+const out = $('#out'), input = $('#cmd');
+function line(segs) {
+  const d = document.createElement('div'); d.className = 'ln';
+  for (const s of segs) { const sp = document.createElement('span'); if (s.c) sp.className = s.c; sp.textContent = s.t; d.append(sp); }
+  if (!d.childNodes.length) d.textContent = '​';
+  out.append(d);
+  while (out.childElementCount > 600) out.firstElementChild.remove();
+  out.scrollTop = out.scrollHeight;
+}
+const say = (t, c) => String(t).split('\n').forEach(l => line([{ t: l, c }]));
+const promptStr = () => toPath(cwd) + ' $ ';
+const printCmd = t => line([{ t: promptStr(), c: 'prompt' }, { t }]);
+let buf = [];
+const emit = (t, c) => buf.push({ t: String(t), c });
+
+/* ---------- Terminal : lecture de la ligne ---------- */
+function tokenize(s) {
+  const toks = []; let cur = '', q = null, has = false;
+  const push = () => { if (cur || has) { toks.push(cur); cur = ''; has = false; } };
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (q) { if (ch === q) q = null; else cur += ch; }
+    else if (ch === '"' || ch === "'") { q = ch; has = true; }
+    else if (/\s/.test(ch)) push();
+    else if (ch === '>') { push(); if (s[i + 1] === '>') { toks.push({ redir: '>>' }); i++; } else toks.push({ redir: '>' }); }
+    else cur += ch;
+  }
+  if (q) throw new CmdError('guillemet non fermé');
+  push();
+  return toks;
+}
+function flagsOf(a) {
+  const flags = new Set(), rest = [];
+  for (const t of a) { if (t.length > 1 && t[0] === '-' && !/^-\d/.test(t)) for (const c of t.slice(1)) flags.add(c); else rest.push(t); }
+  return { flags, rest };
+}
+const need = (p, cmd) => { const ps = absParts(p, cwd), n = getNode(ps); if (!n) throw new CmdError(`${cmd} : ${p} : introuvable`); return { ps, n }; };
+const textOf = (n, p, cmd) => {
+  if (n.t === 'd') throw new CmdError(`${cmd} : ${p} : c'est un dossier`);
+  if (n.kind !== 'text') throw new CmdError(`${cmd} : ${p} : fichier non texte (${fmt(n.size)})`);
+  return n.content;
+};
+const destPath = (srcPs, d) => { const dps = absParts(d, cwd), dn = getNode(dps); return dn && dn.t === 'd' ? [...dps, srcPs[srcPs.length - 1]] : dps; };
+
+/* ---------- Commandes ---------- */
+const NOT_RUN = ['node', 'npm', 'npx', 'pnpm', 'yarn', 'git', 'python', 'python3', 'pip', 'bash', 'sh', 'curl', 'ssh', 'pm2'];
+const commands = {
+  help() {
+    emit('Commandes disponibles :');
+    [['ls [-l] [-a] [dossier]', 'liste le contenu (-a montre les fichiers cachés)'],
+     ['cd <dossier>', 'change de dossier (cd .. pour remonter)'], ['pwd', 'affiche le dossier courant'],
+     ['cat <fichier>', 'affiche un fichier'], ['head / tail [-n N] <fichier>', 'début ou fin d\'un fichier'],
+     ['mkdir [-p] <dossier>', 'crée un dossier'], ['touch <fichier>', 'crée un fichier vide'],
+     ['rm [-r] <nom>', 'supprime'], ['rmdir <dossier>', 'supprime un dossier vide'],
+     ['mv <source> <cible>', 'déplace ou renomme'], ['cp [-r] <source> <cible>', 'copie'],
+     ['echo texte > fichier', 'écrit dans un fichier (>> pour ajouter)'], ['tree [dossier]', 'arborescence'],
+     ['find [dossier] -name "*.js"', 'cherche des fichiers'], ['grep [-i] [-n] [-r] mot fichier', 'cherche du texte'],
+     ['wc <fichier>', 'lignes, mots, octets'], ['open <fichier|dossier>', 'ouvre dans l\'explorateur'],
+     ['import', 'ouvre la fenêtre d\'import de fichiers'], ['clear', 'vide l\'écran'], ['history', 'commandes précédentes'],
+     ['sauvegarde', 'état de la sauvegarde automatique']
+    ].forEach(([c, d]) => emit('  ' + c.padEnd(32) + d));
+    emit('Tab complète les noms, ↑ ↓ rappellent les commandes.', 'dim');
+    emit('Ce terminal est simulé : il ne lance pas de programmes (node, npm, git…).', 'dim');
+  },
+  ls(a) {
+    const { flags, rest } = flagsOf(a), long = flags.has('l'), all = flags.has('a'), targets = rest.length ? rest : ['.'];
+    targets.forEach((p, i) => {
+      const { n } = need(p, 'ls');
+      if (targets.length > 1) { if (i) emit(''); emit(p + ' :'); }
+      const items = n.t === 'd' ? sorted(n).filter(([k]) => all || !k.startsWith('.')) : [[p, n]];
+      items.forEach(([k, c]) => emit(long ? `${c.t === 'd' ? 'd' : '-'} ${(c.t === 'd' ? '-' : fmt(c.size)).padStart(8)}  ${k}${c.t === 'd' ? '/' : ''}` : k + (c.t === 'd' ? '/' : ''), c.t === 'd' ? 'dir' : ''));
+      if (!items.length) emit('(vide)', 'dim');
+    });
+  },
+  cd(a) {
+    const p = a[0] || '/', ps = absParts(p, cwd), n = getNode(ps);
+    if (!n) throw new CmdError(`cd : ${p} : introuvable`);
+    if (n.t !== 'd') throw new CmdError(`cd : ${p} : ce n'est pas un dossier`);
+    cwd = ps;
+  },
+  pwd() { emit(toPath(cwd)); },
+  cat(a) {
+    if (!a.length) throw new CmdError('cat : indique un fichier');
+    for (const p of a) { const { n } = need(p, 'cat'); emit(textOf(n, p, 'cat').replace(/\n$/, '')); }
+  },
+  head(a) { headTail('head', a); },
+  tail(a) { headTail('tail', a); },
+  mkdir(a) {
+    const { flags, rest } = flagsOf(a);
+    if (!rest.length) throw new CmdError('mkdir : indique un nom de dossier');
+    for (const p of rest) {
+      const ps = absParts(p, cwd);
+      if (!ps.length) throw new CmdError('mkdir : nom invalide');
+      if (flags.has('p')) { ensureDirs(ps); continue; }
+      const par = getNode(ps.slice(0, -1));
+      if (!par || par.t !== 'd') throw new CmdError(`mkdir : ${p} : le dossier parent n'existe pas (utilise -p)`);
+      if (par.kids.has(ps[ps.length - 1])) throw new CmdError(`mkdir : ${p} : existe déjà`);
+      par.kids.set(ps[ps.length - 1], mkDir());
+    }
+  },
+  touch(a) {
+    if (!a.length) throw new CmdError('touch : indique un nom de fichier');
+    for (const p of a) { const ps = absParts(p, cwd); if (!ps.length) throw new CmdError('touch : nom invalide'); if (!getNode(ps)) putFile(ps, mkText('')); }
+  },
+  rm(a) {
+    const { flags, rest } = flagsOf(a), r = flags.has('r') || flags.has('R'), f = flags.has('f');
+    if (!rest.length) throw new CmdError('rm : indique ce qu\'il faut supprimer');
+    for (const p of rest) {
+      const ps = absParts(p, cwd), n = getNode(ps);
+      if (!ps.length) throw new CmdError('rm : impossible de supprimer la racine');
+      if (!n) { if (f) continue; throw new CmdError(`rm : ${p} : introuvable`); }
+      if (n.t === 'd' && !r) throw new CmdError(`rm : ${p} : c'est un dossier (utilise rm -r)`);
+      removeNode(ps);
+    }
+  },
+  rmdir(a) {
+    for (const p of a) {
+      const { ps, n } = need(p, 'rmdir');
+      if (n.t !== 'd') throw new CmdError(`rmdir : ${p} : ce n'est pas un dossier`);
+      if (n.kids.size) throw new CmdError(`rmdir : ${p} : le dossier n'est pas vide`);
+      removeNode(ps);
+    }
+  },
+  mv(a) { transfer('mv', a); },
+  cp(a) { transfer('cp', a); },
+  echo(a) { emit(a.join(' ')); },
+  clear() { out.replaceChildren(); },
+  tree(a) {
+    const p = a[0] || '.', { n } = need(p, 'tree');
+    emit(p, 'dir');
+    if (n.t !== 'd') return;
+    let count = 0;
+    (function walk(node, pre) {
+      const es = sorted(node);
+      es.forEach(([name, ch], i) => {
+        if (++count > 400) return;
+        const last = i === es.length - 1;
+        emit(pre + (last ? '└── ' : '├── ') + name, ch.t === 'd' ? 'dir' : '');
+        if (ch.t === 'd') walk(ch, pre + (last ? '    ' : '│   '));
+      });
+    })(n, '');
+    if (count > 400) emit('… affichage limité à 400 lignes', 'dim');
+  },
+  find(a) {
+    let start = '.', pat = null;
+    for (let i = 0; i < a.length; i++) { if (a[i] === '-name') pat = a[++i]; else start = a[i]; }
+    const { ps, n } = need(start, 'find');
+    const re = pat ? new RegExp('^' + pat.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$', 'i') : null;
+    let count = 0;
+    (function walk(node, p) {
+      if (node.t !== 'd') return;
+      for (const [k, c] of sorted(node)) {
+        const cp = [...p, k];
+        if ((!re || re.test(k)) && ++count <= 300) emit(toPath(cp), c.t === 'd' ? 'dir' : '');
+        walk(c, cp);
+      }
+    })(n, ps);
+    if (!count) emit('Aucun résultat.', 'dim');
+    if (count > 300) emit('… affichage limité à 300 résultats', 'dim');
+  },
+  grep(a) {
+    const { flags, rest } = flagsOf(a), ic = flags.has('i'), showN = flags.has('n'), rec = flags.has('r') || flags.has('R');
+    if (!rest.length) throw new CmdError('grep : indique un mot à chercher');
+    const word = ic ? rest[0].toLowerCase() : rest[0], targets = rest.slice(1).length ? rest.slice(1) : (rec ? ['.'] : []);
+    if (!targets.length) throw new CmdError('grep : indique un fichier (ou utilise -r pour un dossier)');
+    const files = [];
+    for (const p of targets) {
+      const { ps, n } = need(p, 'grep');
+      if (n.t === 'd') {
+        if (!rec) throw new CmdError(`grep : ${p} : c'est un dossier (utilise -r)`);
+        (function walk(node, q) { for (const [k, c] of sorted(node)) { if (c.t === 'd') walk(c, [...q, k]); else files.push([[...q, k], c]); } })(n, ps);
+      } else files.push([ps, n]);
+    }
+    const multi = files.length > 1 || rec; let hits = 0;
+    for (const [ps, n] of files) {
+      if (n.kind !== 'text') continue;
+      n.content.split('\n').forEach((l, i) => {
+        if ((ic ? l.toLowerCase() : l).includes(word) && ++hits <= 300) emit((multi ? toPath(ps) + ':' : '') + (showN ? (i + 1) + ':' : '') + l);
+      });
+    }
+    if (!hits) emit('Aucune correspondance.', 'dim');
+  },
+  wc(a) {
+    if (!a.length) throw new CmdError('wc : indique un fichier');
+    for (const p of a) {
+      const { n } = need(p, 'wc'), c = textOf(n, p, 'wc');
+      emit(`${(c.match(/\n/g) || []).length} lignes  ${(c.trim() ? c.trim().split(/\s+/).length : 0)} mots  ${n.size} octets  ${p}`);
+    }
+  },
+  open(a) {
+    const { ps, n } = need(a[0] || '.', 'open');
+    if (n.t === 'd') { exp = ps; view = null; refresh(); emit('Explorateur : ' + toPath(ps), 'dim'); }
+    else { view = ps; exp = ps.slice(0, -1); refresh(); }
+  },
+  import() { emit(`Choisis les fichiers dans la fenêtre qui s'ouvre : ils seront ajoutés dans ${toPath(exp)} (dossier affiché dans l'explorateur).`, 'dim'); $('#fileIn').click(); },
+  history() { history.forEach((h, i) => emit(String(i + 1).padStart(3) + '  ' + h)); if (!history.length) emit('(vide)', 'dim'); },
+  date() { emit(new Date().toLocaleString('fr-FR')); },
+  whoami() { emit('invité'); }
+};
+commands.explorer = commands.open; commands.code = commands.open; commands.nano = commands.open; commands.edit = commands.open;
+commands.dir = commands.ls; commands.type = commands.cat;
+commands.sauvegarde = () => emit($('#saveTxt').textContent); commands.save = commands.sauvegarde;
+for (const n of NOT_RUN) commands[n] = () => { throw new CmdError(`${n} : non exécuté. Ce terminal est simulé dans le navigateur, il ne peut pas lancer de programmes.`); };
+
+function headTail(name, a) {
+  let n = 10; const files = [];
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] === '-n') { n = parseInt(a[++i], 10); if (!(n >= 0)) throw new CmdError(name + ' : nombre de lignes invalide'); }
+    else files.push(a[i]);
+  }
+  if (!files.length) throw new CmdError(name + ' : indique un fichier');
+  for (const p of files) {
+    const { n: node } = need(p, name), ls = textOf(node, p, name).replace(/\n$/, '').split('\n');
+    emit((name === 'head' ? ls.slice(0, n) : (n ? ls.slice(-n) : [])).join('\n'));
+  }
+}
+function transfer(cmd, a) {
+  const { flags, rest } = flagsOf(a), rec = flags.has('r') || flags.has('R');
+  if (rest.length < 2) throw new CmdError(`${cmd} : indique une source et une destination`);
+  const d = rest[rest.length - 1], srcs = rest.slice(0, -1), dn = getNode(absParts(d, cwd));
+  if (srcs.length > 1 && !(dn && dn.t === 'd')) throw new CmdError(`${cmd} : la destination doit être un dossier`);
+  for (const p of srcs) {
+    const { ps, n } = need(p, cmd), target = destPath(ps, d);
+    if (n.t === 'd' && cmd === 'cp' && !rec) throw new CmdError(`cp : ${p} : c'est un dossier (utilise cp -r)`);
+    if (target.join('/') === ps.join('/')) continue;
+    if (n.t === 'd' && isPrefix(ps, target)) throw new CmdError(`${cmd} : impossible de mettre un dossier dans lui-même`);
+    const par = getNode(target.slice(0, -1));
+    if (!target.length || !par || par.t !== 'd') throw new CmdError(`${cmd} : ${d} : destination introuvable`);
+    const existing = par.kids.get(target[target.length - 1]);
+    if (existing && (existing.t === 'd' || n.t === 'd')) throw new CmdError(`${cmd} : ${toPath(target)} existe déjà`);
+    par.kids.set(target[target.length - 1], cmd === 'cp' ? clone(n) : n);
+    if (cmd === 'mv') { removeNode(ps); if (isPrefix(ps, cwd)) cwd = [...target, ...cwd.slice(ps.length)]; }
+  }
+}
+
+/* ---------- Exécution d'une ligne ---------- */
+function flush() { for (const b of buf) say(b.t, b.c); buf = []; }
+function run(text) {
+  printCmd(text);
+  if (!text.trim()) return;
+  if (history[history.length - 1] !== text) history.push(text);
+  hIdx = history.length;
+  let toks;
+  try { toks = tokenize(text); } catch (e) { say(e.message, 'err'); return; }
+  const ri = toks.findIndex(t => typeof t === 'object');
+  let redir = null;
+  if (ri >= 0) {
+    if (typeof toks[ri + 1] !== 'string') { say('redirection : indique un nom de fichier après >', 'err'); return; }
+    redir = { mode: toks[ri].redir, target: toks[ri + 1] };
+    toks.splice(ri, 2);
+  }
+  if (toks.some(t => typeof t === 'object')) { say('une seule redirection est permise', 'err'); return; }
+  if (!toks.length) { say('commande manquante avant >', 'err'); return; }
+  const [name, ...args] = toks, fn = Object.hasOwn(commands, name) ? commands[name] : null;
+  if (!fn) { say(`${name} : commande introuvable. Tape help pour la liste.`, 'err'); return; }
+  buf = [];
+  try { fn(args); }
+  catch (e) { if (e instanceof CmdError) emit(e.message, 'err'); else { console.error(e); emit('erreur interne : ' + e.message, 'err'); } }
+  if (redir) {
+    const data = buf.filter(b => b.c !== 'err'), errs = buf.filter(b => b.c === 'err');
+    buf = errs;
+    try {
+      const ps = absParts(redir.target, cwd), ex = getNode(ps);
+      const old = redir.mode === '>>' && ex && ex.kind === 'text' ? ex.content : '';
+      if (ex && ex.t === 'f' && ex.kind !== 'text' && redir.mode === '>>') throw new CmdError('impossible d\'ajouter à un fichier non texte');
+      putFile(ps, mkText(old + data.map(b => b.t).join('\n') + (data.length ? '\n' : '')));
+    } catch (e) { if (e instanceof CmdError) emit('redirection : ' + e.message, 'err'); else throw e; }
+  }
+  flush();
+  refresh();
+}
+
+/* ---------- Complétion et historique ---------- */
+function complete() {
+  const val = input.value, before = val.slice(0, input.selectionStart), word = before.match(/\S*$/)[0], start = before.length - word.length;
+  let cands;
+  if (!before.slice(0, start).trim()) cands = Object.keys(commands).filter(c => c.startsWith(word));
+  else {
+    const sl = word.lastIndexOf('/'), dp = sl >= 0 ? word.slice(0, sl + 1) : '', np = word.slice(sl + 1), d = getNode(absParts(dp || '.', cwd));
+    cands = d && d.t === 'd' ? [...d.kids].filter(([k]) => k.startsWith(np)).map(([k, c]) => dp + k + (c.t === 'd' ? '/' : '')) : [];
+  }
+  if (!cands.length) return;
+  const common = cands.reduce((a, b) => { let i = 0; while (i < a.length && a[i] === b[i]) i++; return a.slice(0, i); });
+  const done = cands.length === 1;
+  let rep = common.includes(' ') ? '"' + common + (done && !common.endsWith('/') ? '"' : '') : common;
+  if (done && !common.endsWith('/')) rep += ' ';
+  if (!done && common.length <= word.length) { printCmd(val); say(cands.join('   '), 'dim'); return; }
+  input.value = val.slice(0, start) + rep + val.slice(input.selectionStart);
+}
+input.addEventListener('keydown', e => {
+  if (e.key === 'Tab') { e.preventDefault(); complete(); }
+  else if (e.key === 'ArrowUp') { e.preventDefault(); if (hIdx > 0) input.value = history[--hIdx]; }
+  else if (e.key === 'ArrowDown') { e.preventDefault(); hIdx = Math.min(hIdx + 1, history.length); input.value = history[hIdx] || ''; }
+  else if (e.ctrlKey && e.key.toLowerCase() === 'l') { e.preventDefault(); out.replaceChildren(); }
+  else if (e.ctrlKey && e.key.toLowerCase() === 'c') { if (!getSelection().toString()) { e.preventDefault(); printCmd(input.value + '^C'); input.value = ''; } }
+});
+$('#promptForm').addEventListener('submit', e => { e.preventDefault(); const t = input.value; input.value = ''; run(t); });
+out.addEventListener('click', () => { if (!getSelection().toString()) input.focus(); });
+
+/* ---------- Explorateur ---------- */
+const SVG_DIR = '<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path d="M2 5.5A1.5 1.5 0 0 1 3.5 4h4l1.6 1.8h7.4A1.5 1.5 0 0 1 18 7.3v7.2a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 2 14.5z" fill="currentColor"/></svg>';
+const SVG_FILE = '<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path d="M5 2.5h6l4 4v10a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-13a1 1 0 0 1 1-1zM11 2.5v4h4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>';
+const SVG_UP = '<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path d="M10 16V5m0 0L5.5 9.5M10 5l4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+const btn = (label, cls, fn, aria) => { const b = el('button', 'btn ' + cls, label); b.type = 'button'; if (aria) b.setAttribute('aria-label', aria); b.addEventListener('click', fn); return b; };
+const quote = s => /\s/.test(s) ? '"' + s + '"' : s;
+let statusTimer = 0;
+function setStatus(msg) { const s = $('#status'); s.textContent = msg; clearTimeout(statusTimer); if (msg) statusTimer = setTimeout(() => { s.textContent = ''; }, 6000); }
+
+function termGo(ps) {
+  cwd = ps.slice();
+  printCmd('cd ' + (cwd.length ? quote(toPath(cwd)) : '/'));
+  refresh();
+  input.focus({ preventScroll: true });
+}
+function goExp(ps) { exp = ps; view = null; refresh(); }
+
+function renderCrumbs() {
+  const c = $('#crumbs'); c.replaceChildren();
+  const all = [[], ...exp.map((_, i) => exp.slice(0, i + 1))];
+  all.forEach((ps, i) => {
+    if (i > 1) c.append(el('span', 'sep', '/'));
+    const b = el('button', '', i ? ps[ps.length - 1] : '/'); b.type = 'button';
+    if (i === all.length - 1) b.setAttribute('aria-current', 'location'); else b.addEventListener('click', () => goExp(ps));
+    c.append(b);
+  });
+}
+function renderList() {
+  const list = $('#list'), d = getNode(exp); list.replaceChildren();
+  if (exp.length) {
+    const li = el('li', 'row dir'), b = el('button', 'row-main'); b.type = 'button';
+    b.innerHTML = SVG_UP; b.append(el('span', 'name', 'Dossier parent'), el('span', 'meta', '..'));
+    b.addEventListener('click', () => goExp(exp.slice(0, -1))); li.append(b); list.append(li);
+  }
+  for (const [name, n] of sorted(d)) {
+    const ps = [...exp, name], isDir = n.t === 'd';
+    const li = el('li', 'row ' + (isDir ? 'dir' : 'file')), b = el('button', 'row-main'); b.type = 'button';
+    b.innerHTML = isDir ? SVG_DIR : SVG_FILE;
+    b.append(el('span', 'name', name), el('span', 'meta', isDir ? n.kids.size + (n.kids.size > 1 ? ' éléments' : ' élément') : fmt(n.size)));
+    b.addEventListener('click', () => { if (isDir) goExp(ps); else { view = ps; refresh(); } });
+    const acts = el('div', 'row-actions');
+    if (isDir) acts.append(btn('Terminal', 'sm', () => termGo(ps), 'Ouvrir ' + name + ' dans le terminal'));
+    const del = btn('Supprimer', 'sm danger', () => {
+      if (del.dataset.armed) { clearTimeout(+del.dataset.t); removeNode(ps); refresh(); setStatus(name + ' supprimé.'); return; }
+      del.dataset.armed = '1'; del.textContent = 'Sûr ?';
+      del.dataset.t = setTimeout(() => { delete del.dataset.armed; del.textContent = 'Supprimer'; }, 3000);
+    }, 'Supprimer ' + name);
+    acts.append(del); li.append(b, acts); list.append(li);
+  }
+  $('#empty').hidden = d.kids.size > 0;
+}
+function renderView() {
+  const n = view && getNode(view), fv = $('#fileView');
+  if (!n || n.t !== 'f') { $('#browse').hidden = false; fv.hidden = true; shownNode = null; shownPath = ''; return; }
+  $('#browse').hidden = true; fv.hidden = false;
+  if (shownNode === n && shownPath === toPath(view)) return;
+  shownNode = n; shownPath = toPath(view);
+  const name = view[view.length - 1], head = el('div', 'pane-head');
+  const title = el('div', 'file-title'); title.append(el('b', '', name), el('span', '', toPath(view) + ' · ' + fmt(n.size)));
+  head.append(btn('← Retour', '', () => { view = null; refresh(); }), title);
+  let body;
+  if (n.kind === 'text') {
+    body = el('textarea'); body.id = 'fileText'; body.value = n.content; body.spellcheck = false; body.setAttribute('aria-label', 'Contenu de ' + name);
+    head.append(btn('Enregistrer', 'primary', () => {
+      const nn = mkText(body.value); putFile(view, nn); shownNode = nn; refresh(); setStatus(name + ' enregistré.');
+      fv.querySelector('.file-title span').textContent = toPath(view) + ' · ' + fmt(nn.size);
+    }));
+  } else if (n.kind === 'image') {
+    body = el('div', 'file-img'); const img = el('img'); img.src = n.dataUrl; img.alt = name; body.append(img);
+  } else {
+    body = el('div', 'empty', 'Ce fichier n\'est pas du texte : il est importé (' + fmt(n.size) + ') mais ne peut pas être affiché ici.');
+  }
+  head.append(btn('Terminal', '', () => termGo(view.slice(0, -1)), 'Ouvrir le dossier du fichier dans le terminal'));
+  fv.replaceChildren(head, body);
+}
+function refresh() {
+  while (exp.length && !(getNode(exp) && getNode(exp).t === 'd')) exp.pop();
+  while (cwd.length && !(getNode(cwd) && getNode(cwd).t === 'd')) cwd.pop();
+  if (view && !(getNode(view) && getNode(view).t === 'f')) view = null;
+  renderCrumbs(); renderList(); renderView();
+  $('#promptLbl').textContent = promptStr();
+  saveSoon();
+}
+
+/* Création depuis l'explorateur */
+let newMode = null;
+function openNew(mode) {
+  newMode = mode; const f = $('#newForm'), i = $('#newName');
+  f.hidden = false; i.value = ''; i.setAttribute('aria-label', mode === 'dir' ? 'Nom du nouveau dossier' : 'Nom du nouveau fichier');
+  i.placeholder = mode === 'dir' ? 'Nom du dossier' : 'Nom du fichier (ex. notes.txt)'; i.focus();
+}
+$('#newCancel').addEventListener('click', () => { $('#newForm').hidden = true; });
+$('#newName').addEventListener('keydown', e => { if (e.key === 'Escape') $('#newForm').hidden = true; });
+$('#newForm').addEventListener('submit', e => {
+  e.preventDefault();
+  const name = $('#newName').value.trim();
+  if (!name || /[\/\\]/.test(name)) { setStatus('Nom invalide : évite les caractères / et \\.'); return; }
+  const d = getNode(exp);
+  if (d.kids.has(name)) { setStatus(name + ' existe déjà ici.'); return; }
+  d.kids.set(name, newMode === 'dir' ? mkDir() : mkText(''));
+  $('#newForm').hidden = true; refresh(); setStatus(name + ' créé.');
+  if (newMode === 'file') { view = [...exp, name]; refresh(); }
+});
+$('#btnNewDir').addEventListener('click', () => openNew('dir'));
+$('#btnNewFile').addEventListener('click', () => openNew('file'));
+$('#btnTerm').addEventListener('click', () => termGo(exp));
+
+/* ---------- Import ---------- */
+async function readFile(f) {
+  if (f.type.startsWith('image/') && f.size <= 8e6) {
+    const url = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(f); });
+    return { t: 'f', kind: 'image', dataUrl: url, size: f.size };
+  }
+  if (f.size > 5e6) return { t: 'f', kind: 'bin', size: f.size };
+  const buf = await f.arrayBuffer(), u = new Uint8Array(buf), m = Math.min(u.length, 4096);
+  for (let i = 0; i < m; i++) if (u[i] === 0) return { t: 'f', kind: 'bin', size: f.size };
+  return { t: 'f', kind: 'text', content: new TextDecoder().decode(buf), size: f.size };
+}
+async function addFile(ps, f, stat) {
+  try { ensureDirs(ps.slice(0, -1)); putFile(ps, await readFile(f)); stat.ok++; }
+  catch (e) { stat.fail++; }
+}
+async function walkEntry(entry, base, stat) {
+  if (entry.isFile) { const f = await new Promise((res, rej) => entry.file(res, rej)); await addFile([...base, entry.name], f, stat); }
+  else if (entry.isDirectory) {
+    const dp = [...base, entry.name]; ensureDirs(dp);
+    const rd = entry.createReader(), all = [];
+    for (;;) { const b = await new Promise((res, rej) => rd.readEntries(res, rej)); if (!b.length) break; all.push(...b); }
+    for (const e of all) await walkEntry(e, dp, stat);
+  }
+}
+function finishImport(stat, base) {
+  refresh();
+  const msg = stat.ok + (stat.ok > 1 ? ' fichiers importés' : ' fichier importé') + ' dans ' + toPath(base) + (stat.fail ? ' (' + stat.fail + ' en erreur)' : '');
+  setStatus(msg); line([{ t: 'importé : ' + msg, c: stat.fail ? 'err' : 'ok' }]);
+}
+async function importList(files, useRel) {
+  const base = exp.slice(), stat = { ok: 0, fail: 0 };
+  for (const f of files) {
+    const rel = useRel && f.webkitRelativePath ? f.webkitRelativePath : f.name;
+    await addFile([...base, ...rel.split('/').filter(Boolean)], f, stat);
+  }
+  finishImport(stat, base);
+}
+$('#btnFiles').addEventListener('click', () => $('#fileIn').click());
+$('#btnDir').addEventListener('click', () => $('#dirIn').click());
+$('#fileIn').addEventListener('change', e => { const fs = [...e.target.files]; e.target.value = ''; if (fs.length) importList(fs, false); });
+$('#dirIn').addEventListener('change', e => { const fs = [...e.target.files]; e.target.value = ''; if (fs.length) importList(fs, true); });
+
+const pane = $('#explorer'); let dragDepth = 0;
+const hasFiles = e => e.dataTransfer && [...e.dataTransfer.types].includes('Files');
+pane.addEventListener('dragenter', e => { if (hasFiles(e)) { e.preventDefault(); dragDepth++; pane.classList.add('dragging'); } });
+pane.addEventListener('dragover', e => { if (hasFiles(e)) e.preventDefault(); });
+pane.addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; pane.classList.remove('dragging'); } });
+pane.addEventListener('drop', async e => {
+  if (!hasFiles(e)) return;
+  e.preventDefault(); dragDepth = 0; pane.classList.remove('dragging');
+  const base = exp.slice(), stat = { ok: 0, fail: 0 };
+  const items = [...(e.dataTransfer.items || [])], entries = items.map(i => i.webkitGetAsEntry && i.webkitGetAsEntry()).filter(Boolean);
+  const plain = [...e.dataTransfer.files];
+  try {
+    if (entries.length) for (const en of entries) await walkEntry(en, base, stat);
+    else for (const f of plain) await addFile([...base, f.name], f, stat);
+  } catch (err) { stat.fail++; }
+  finishImport(stat, base);
+});
+document.addEventListener('dragover', e => { if (hasFiles(e)) e.preventDefault(); });
+document.addEventListener('drop', e => { if (hasFiles(e)) e.preventDefault(); });
+
+/* ---------- Sauvegarde automatique (capacité db : espace privé de chaque personne) ---------- */
+const persist = { ready: false, busy: false, again: false, timer: 0, refs: new Map(), col: null, metaDone: false };
+const bootScan = new Map();
+function scan() {
+  const m = new Map();
+  (function walk(n, ps) { for (const [k, c] of n.kids) { const q = [...ps, k]; m.set(toPath(q), c); if (c.t === 'd') walk(c, q); } })(root, []);
+  return m;
+}
+function hash(s) {
+  let h1 = 0xdeadbeef ^ s.length, h2 = 0x41c6ce57 ^ s.length;
+  for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); h1 = Math.imul(h1 ^ c, 2654435761); h2 = Math.imul(h2 ^ c, 1597334677); }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+}
+const docId = p => 'f-' + hash(p);
+const MAX_DOC = 240000;   // la limite d'un document est de 256 Kio
+function toDoc(p, n) {
+  if (n.t === 'd') return { path: p, type: 'd' };
+  const base = { path: p, type: 'f', size: n.size };
+  if (n.kind === 'text' || n.kind === 'image') {
+    const d = n.kind === 'text' ? { ...base, kind: 'text', content: n.content } : { ...base, kind: 'image', dataUrl: n.dataUrl };
+    if (byteLen(JSON.stringify(d)) <= MAX_DOC) { n.partial = false; return d; }
+    n.partial = true;
+    return { ...base, kind: 'big' };
+  }
+  return { ...base, kind: 'bin' };
+}
+function fromDoc(d) {
+  if (d.type === 'd') return mkDir();
+  if (d.kind === 'text') return { t: 'f', kind: 'text', content: String(d.content || ''), size: d.size | 0 };
+  if (d.kind === 'image' && d.dataUrl) return { t: 'f', kind: 'image', dataUrl: String(d.dataUrl), size: d.size | 0 };
+  return { t: 'f', kind: 'bin', size: d.size | 0, partial: d.kind === 'big' };
+}
+function setSave(s, txt) { $('#save').dataset.s = s; $('#saveTxt').textContent = txt; }
+function reportSaved(now) {
+  const bad = [...now.values()].filter(n => n.t === 'f' && (n.kind === 'bin' || n.partial)).length;
+  setSave('ok', 'Sauvegardé' + (bad ? ' · ' + bad + (bad > 1 ? ' fichiers' : ' fichier') + ' sans contenu enregistré (binaire ou trop gros)' : ''));
+}
+async function retry(fn) {
+  try { return await fn(); }
+  catch (e) {
+    if (e && (e.code === 'unavailable' || e.code === 'resource_exhausted')) { await new Promise(r => setTimeout(r, 800 + Math.random() * 700)); return await fn(); }
+    throw e;
+  }
+}
+function saveSoon() { if (!persist.ready) return; clearTimeout(persist.timer); persist.timer = setTimeout(flushSave, 700); }
+async function flushSave() {
+  if (!persist.ready) return;
+  if (persist.busy) { persist.again = true; return; }
+  persist.busy = true;
+  try {
+    do {
+      persist.again = false;
+      const now = scan(), ops = [];
+      if (now.size > 1000) { setSave('err', 'Sauvegarde limitée à 1000 éléments : supprime-en pour la reprendre.'); continue; }
+      for (const [p, n] of now) if (persist.refs.get(p) !== n) ops.push(['set', p, n]);
+      for (const p of persist.refs.keys()) if (!now.has(p)) ops.push(['del', p]);
+      if (ops.length || !persist.metaDone) {
+        setSave('busy', 'Enregistrement…');
+        if (!persist.metaDone) { await retry(() => persist.col.doc('meta').set({ initialized: true, v: 1 })); persist.metaDone = true; }
+        for (let i = 0; i < ops.length; i += 4) {
+          await Promise.all(ops.slice(i, i + 4).map(async ([k, p, n]) => {
+            const ref = persist.col.doc(docId(p));
+            if (k === 'set') { await retry(() => ref.set(toDoc(p, n))); persist.refs.set(p, n); }
+            else { await retry(() => ref.delete()); persist.refs.delete(p); }
+          }));
+        }
+      }
+      reportSaved(now);
+    } while (persist.again);
+  } catch (e) {
+    setSave('err', e && e.code === 'permission_denied' ? "Accès refusé par Firebase : colle les règles de sécurité Firestore (voir le guide)." : e && e.code === 'quota_exceeded' ? 'Espace de sauvegarde plein : supprime des fichiers.' : 'Sauvegarde impossible pour le moment, nouvel essai à ta prochaine action.');
+  }
+  persist.busy = false;
+}
+async function initPersist(db, id) {
+  try {
+    persist.col = db.collection('users/' + id + '/files');
+    const snap = await persist.col.limit(1000).get();
+    const docs = snap.docs.filter(d => d.exists);
+    if (docs.some(d => d.id === 'meta')) {
+      const now = scan(); let touched = now.size !== bootScan.size;
+      if (!touched) for (const [p, n] of now) if (bootScan.get(p) !== n) { touched = true; break; }
+      if (!touched) root.kids.clear();   // rien modifié depuis l'ouverture : on remplace l'exemple par la sauvegarde
+      persist.metaDone = true;
+      for (const d of docs) {
+        if (d.id === 'meta') continue;
+        const x = d.data();
+        if (!x || typeof x.path !== 'string') continue;
+        try {
+          const ps = absParts(x.path, []);
+          if (!ps.length || (touched && getNode(ps))) continue;
+          if (x.type === 'd') { if (!getNode(ps)) ensureDirs(ps); persist.refs.set(x.path, getNode(ps)); }
+          else { const n = fromDoc(x); ensureDirs(ps.slice(0, -1)); putFile(ps, n); persist.refs.set(x.path, n); }
+        } catch (e) { /* élément abîmé ou en conflit : ignoré */ }
+      }
+    }
+    persist.ready = true;
+    refresh();
+    flushSave();
+  } catch (e) {
+    setSave('err', e && e.code === 'permission_denied' ? 'Accès refusé par Firebase : colle les règles de sécurité Firestore (voir le guide).' : 'La sauvegarde ne répond pas. Recharge la page pour réessayer.');
+  }
+}
+
+/* ---------- Démarrage ---------- */
+say('Terminal simulé : les commandes agissent sur les fichiers de cette page, rien n\'est exécuté pour de vrai.', 'dim');
+say('Le dossier /exemple contient des fichiers d\'exemple. Tape help pour la liste des commandes.', 'dim');
+refresh();
+for (const [p, n] of scan()) bootScan.set(p, n);
+window.__startPersist = initPersist;
+$('#skipAuth').addEventListener('click', () => { $('#auth').hidden = true; setSave('off', 'Mode sans compte : rien n\'est sauvegardé.'); });
+setTimeout(() => { if (!window.__fbLoaded) { $('#authMsg').textContent = 'Impossible de joindre Firebase (réseau bloqué ou bloqueur de pub ?). Recharge la page ou continue sans compte.'; } }, 8000);
+})();
