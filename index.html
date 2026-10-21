@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Explorateur Terminal</title>
+<link rel="icon" href="logo.svg" type="image/svg+xml">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
 <style>
 /* Disposition : explorateur à gauche (liste ou fichier ouvert), terminal sombre à droite ; une seule colonne sur téléphone. */
@@ -39,7 +40,10 @@ button, input, textarea { font: inherit; color: inherit; }
 button { cursor: pointer; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
-.top { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 16px; }
+.top { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 4px 16px; }
+.brand { display: inline-flex; align-items: center; gap: 10px; color: inherit; text-decoration: none; border-radius: 6px; }
+.brand:hover h1 { color: var(--accent); }
+.logo { flex: none; width: 30px; height: 30px; display: block; }
 .top h1 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: -0.01em; }
 .top p { margin: 0; color: var(--muted); font-size: 12.5px; }
 .top .save { display: flex; align-items: center; gap: 6px; }
@@ -135,7 +139,10 @@ main { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1
 <body>
 
 <header class="top">
-  <h1>Explorateur Terminal</h1>
+  <a class="brand" href="./" aria-label="Explorateur Terminal : retour à l'accueil du site">
+    <svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0e141c"/><path d="M8 11l7 5-7 5" fill="none" stroke="#ffb26b" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M17 22h8" stroke="#ffb26b" stroke-width="2.6" stroke-linecap="round"/></svg>
+    <h1>Explorateur Terminal</h1>
+  </a>
   <div class="info">
     <p id="note">Tes fichiers sont enregistrés dans ton compte, accessibles depuis n'importe quel appareil. Évite d'y importer ton .env (il contient ton token).</p>
     <p class="save" id="save" data-s="busy" role="status"><span class="dot"></span><span id="saveTxt">Connecte-toi pour activer la sauvegarde.</span><span id="who"></span><button type="button" class="btn sm" id="logout" hidden>Se déconnecter</button></p>
@@ -838,14 +845,14 @@ refresh();
 for (const [p, n] of scan()) bootScan.set(p, n);
 window.__startPersist = initPersist;
 $('#skipAuth').addEventListener('click', () => { $('#auth').hidden = true; setSave('off', 'Mode sans compte : rien n\'est sauvegardé.'); });
-setTimeout(() => { if (!window.__fbLoaded) { $('#authMsg').textContent = 'Impossible de joindre Firebase (réseau bloqué ?). Tu peux continuer sans compte.'; } }, 8000);
+setTimeout(() => { if (!window.__fbLoaded) { $('#authMsg').textContent = 'Impossible de joindre Firebase (réseau bloqué ou bloqueur de pub ?). Recharge la page ou continue sans compte.'; } }, 8000);
 })();
 </script>
 
 <script type="module">
-import { initializeApp } from "https://www.gstatic.com/firebasejs/13.0.0/firebase-app.js";
-import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut } from "https://www.gstatic.com/firebasejs/13.0.0/firebase-auth.js";
-import { getFirestore, collection, doc, setDoc, deleteDoc, getDocs, query, limit } from "https://www.gstatic.com/firebasejs/13.0.0/firebase-firestore.js";
+import { initializeApp } from "https://www.gstatic.com/firebasejs/12.18.0/firebase-app.js";
+import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut } from "https://www.gstatic.com/firebasejs/12.18.0/firebase-auth.js";
+import { getFirestore, collection, doc, setDoc, deleteDoc, getDocs, query, limit } from "https://www.gstatic.com/firebasejs/12.18.0/firebase-firestore.js";
 
 const firebaseConfig = {
   apiKey: "AIzaSyAsAgU3SwNCZXMySUdlLMYKk4ytPCZuZig",
