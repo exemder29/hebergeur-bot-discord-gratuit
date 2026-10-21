@@ -32,6 +32,7 @@ function errText(e) {
     case 'auth/email-already-in-use': return 'Ce nom est déjà pris, choisis-en un autre.';
     case 'auth/weak-password': return 'Mot de passe trop court : 6 caractères minimum.';
     case 'auth/operation-not-allowed': return 'Connexion non activée : dans la console Firebase, active « E-mail/Mot de passe ».';
+    case 'auth/configuration-not-found': return 'Authentification non initialisée : dans la console Firebase, ouvre Authentication, clique sur « Commencer », puis active « E-mail/Mot de passe ».';
     case 'auth/network-request-failed': return 'Pas de connexion à Internet.';
     case 'auth/too-many-requests': return 'Trop d\'essais, réessaie dans un moment.';
     default: return 'Erreur : ' + (e.code || e.message);
