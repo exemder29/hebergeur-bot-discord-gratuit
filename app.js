@@ -597,7 +597,7 @@ async function flushSave() {
       reportSaved(now);
     } while (persist.again);
   } catch (e) {
-    setSave('err', e && e.code === 'permission_denied' ? "Accès refusé par Firebase : colle les règles de sécurité Firestore (voir le guide)." : e && e.code === 'quota_exceeded' ? 'Espace de sauvegarde plein : supprime des fichiers.' : 'Sauvegarde impossible pour le moment, nouvel essai à ta prochaine action.');
+    setSave('err', e && e.code === 'permission_denied' ? 'Accès refusé par Firebase : dans la console, crée la base Firestore puis publie les règles du fichier firestore.rules (onglet Règles).' : e && e.code === 'quota_exceeded' ? 'Espace de sauvegarde plein : supprime des fichiers.' : 'Sauvegarde impossible pour le moment, nouvel essai à ta prochaine action.');
   }
   persist.busy = false;
 }
@@ -627,7 +627,7 @@ async function initPersist(db, id) {
     refresh();
     flushSave();
   } catch (e) {
-    setSave('err', e && e.code === 'permission_denied' ? 'Accès refusé par Firebase : colle les règles de sécurité Firestore (voir le guide).' : 'La sauvegarde ne répond pas. Recharge la page pour réessayer.');
+    setSave('err', e && e.code === 'permission_denied' ? 'Accès refusé par Firebase : dans la console, crée la base Firestore puis publie les règles du fichier firestore.rules (onglet Règles).' : 'La sauvegarde ne répond pas. Recharge la page pour réessayer.');
   }
 }
 
